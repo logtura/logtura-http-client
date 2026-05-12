@@ -40,7 +40,6 @@ impl Cursor {
         Ok(Self { current, json_path })
     }
 
-    #[cfg(test)]
     pub fn current(&self) -> &str {
         &self.current
     }

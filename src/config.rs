@@ -179,6 +179,14 @@ fn interpolate_env(input: &str) -> Result<String> {
 }
 
 fn validate(cfg: &Config) -> Result<()> {
+    if cfg.scrape_interval_secs == 0 {
+        return Err(anyhow!(
+            "scrape_interval_secs must be >= 1 (would tight-loop the endpoint)"
+        ));
+    }
+    if cfg.endpoint.is_empty() {
+        return Err(anyhow!("endpoint must not be empty"));
+    }
     match cfg.auth.strategy {
         AuthStrategy::Bearer => {
             if cfg.auth.token.is_none() {

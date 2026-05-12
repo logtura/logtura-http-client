@@ -1,6 +1,6 @@
 [package]
 name = "logtura-http-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 description = "An http_client-shaped HTTP poller with built-in OAuth refresh. Drop-in for Vector's exec source until upstream gets bearer_refresh / oauth_refresh."

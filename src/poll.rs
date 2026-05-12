@@ -32,32 +32,55 @@ pub async fn run(cfg: Config) -> Result<()> {
         reqwest::Method::from_bytes(cfg.method.as_bytes()).context("invalid http method")?;
 
     let interval = Duration::from_secs(cfg.scrape_interval_secs);
-    let mut consecutive_auth_failures = 0u32;
+    let mut stdout = tokio::io::stdout();
+    let mut consecutive_failures = 0u32;
 
     loop {
-        match poll_once(&cfg, &client, &provider, &mut cursor, &rows_path, &method).await {
+        let outcome = poll_once(
+            &cfg,
+            &client,
+            &provider,
+            &mut cursor,
+            &rows_path,
+            &method,
+            &mut stdout,
+        )
+        .await;
+        let sleep_for = match outcome {
             Ok(emitted) => {
-                consecutive_auth_failures = 0;
+                consecutive_failures = 0;
                 tracing::debug!(emitted, "poll cycle done");
+                interval
             }
             Err(PollError::Auth) => {
-                consecutive_auth_failures += 1;
                 tracing::error!(
-                    attempts = consecutive_auth_failures,
                     "auth failed even after refresh; exiting so Vector restarts us"
                 );
                 std::process::exit(EXIT_AUTH_FAILED);
             }
             Err(PollError::Other(err)) => {
-                tracing::warn!(error = %err, "poll cycle failed; backing off");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                // Exponential backoff capped at 10x interval. A hard-
+                // down endpoint shouldn't be hammered every poll_interval
+                // forever — but eventual retry is desirable so we recover
+                // when the endpoint comes back. Reset on first success.
+                let factor = 1u32.checked_shl(consecutive_failures.min(4)).unwrap_or(16);
+                let backoff = interval.saturating_mul(factor.min(10));
+                tracing::warn!(
+                    error = %err,
+                    failures = consecutive_failures,
+                    backoff_secs = backoff.as_secs(),
+                    "poll cycle failed; backing off"
+                );
+                backoff
             }
-        }
-        tokio::time::sleep(interval).await;
+        };
+        tokio::time::sleep(sleep_for).await;
     }
 }
 
 #[derive(Debug)]
-enum PollError {
+pub enum PollError {
     Auth,
     Other(anyhow::Error),
 }
@@ -68,13 +91,19 @@ impl From<anyhow::Error> for PollError {
     }
 }
 
-async fn poll_once(
+/// One iteration of the poll loop. Tests drive this directly so they
+/// can assert on cursor advancement / emission without spinning up
+/// `run`'s infinite loop. Emitted rows go to the `out` writer; in
+/// production this is stdout, in tests it's an `Vec<u8>` we can read
+/// back.
+pub async fn poll_once<W: tokio::io::AsyncWrite + Unpin + Send>(
     cfg: &Config,
     client: &Client,
     provider: &Arc<dyn TokenProvider>,
     cursor: &mut Cursor,
     rows_path: &JsonPath,
     method: &reqwest::Method,
+    out: &mut W,
 ) -> std::result::Result<usize, PollError> {
     let mut token = provider.current(client).await?;
     let response = send(cfg, client, &token, cursor, method).await?;
@@ -118,18 +147,16 @@ async fn poll_once(
         return Ok(0);
     };
 
-    let mut stdout = tokio::io::stdout();
     let mut emitted = 0usize;
     for row in rows {
         let line = serde_json::to_string(row).context("serializing row")?;
-        stdout
-            .write_all(line.as_bytes())
+        out.write_all(line.as_bytes())
             .await
-            .context("writing to stdout")?;
-        stdout.write_all(b"\n").await.context("writing newline")?;
+            .context("writing row")?;
+        out.write_all(b"\n").await.context("writing newline")?;
         emitted += 1;
     }
-    stdout.flush().await.context("flushing stdout")?;
+    out.flush().await.context("flushing writer")?;
 
     cursor.advance(&body);
     Ok(emitted)
@@ -145,6 +172,12 @@ async fn send(
     let url = cursor.substitute(&cfg.endpoint);
     let mut req = client.request(method.clone(), url);
     req = req.header("authorization", format!("Bearer {}", token));
+    // Default Accept header so endpoints that look at the header
+    // before serving JSON get the right thing. Headers from cfg
+    // override this if the user wants something else.
+    if !cfg.headers.contains_key("accept") && !cfg.headers.contains_key("Accept") {
+        req = req.header("accept", "application/json");
+    }
     for (k, v) in &cfg.headers {
         req = req.header(k, cursor.substitute(v));
     }
