@@ -53,9 +53,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 interval
             }
             Err(PollError::Auth) => {
-                tracing::error!(
-                    "auth failed even after refresh; exiting so Vector restarts us"
-                );
+                tracing::error!("auth failed even after refresh; exiting so Vector restarts us");
                 std::process::exit(EXIT_AUTH_FAILED);
             }
             Err(PollError::Other(err)) => {
